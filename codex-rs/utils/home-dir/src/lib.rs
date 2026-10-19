@@ -1,5 +1,7 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
 use dirs::home_dir;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
 
 /// Returns the path to the Codex configuration directory, which can be
@@ -7,43 +9,44 @@ use std::path::PathBuf;
 /// `~/.codex`.
 ///
 /// - If `CODEX_HOME` is set, the value must exist and be a directory. The
-///   value will be canonicalized and this function will Err otherwise.
+///   value will be canonicalized and this function will Err otherwise. A value
+///   that is not valid UTF-8 is honored as-is on Unix platforms.
 /// - If `CODEX_HOME` is not set, this function does not verify that the
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
-    let codex_home_env = std::env::var("CODEX_HOME")
-        .ok()
-        .filter(|val| !val.is_empty());
+    let codex_home_env = std::env::var_os("CODEX_HOME").filter(|val| !val.is_empty());
     find_codex_home_from_env(codex_home_env.as_deref())
 }
 
-fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
+fn find_codex_home_from_env(codex_home_env: Option<&OsStr>) -> std::io::Result<AbsolutePathBuf> {
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     match codex_home_env {
         Some(val) => {
             let path = PathBuf::from(val);
+            // Only used in error messages; non-UTF-8 paths are displayed lossily.
+            let val = Path::new(val).display();
             let metadata = std::fs::metadata(&path).map_err(|err| match err.kind() {
                 std::io::ErrorKind::NotFound => std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("CODEX_HOME points to {val:?}, but that path does not exist"),
+                    format!("CODEX_HOME points to {val}, but that path does not exist"),
                 ),
                 _ => std::io::Error::new(
                     err.kind(),
-                    format!("failed to read CODEX_HOME {val:?}: {err}"),
+                    format!("failed to read CODEX_HOME {val}: {err}"),
                 ),
             })?;
 
             if !metadata.is_dir() {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("CODEX_HOME points to {val:?}, but that path is not a directory"),
+                    format!("CODEX_HOME points to {val}, but that path is not a directory"),
                 ))
             } else {
                 let canonical = path.canonicalize().map_err(|err| {
                     std::io::Error::new(
                         err.kind(),
-                        format!("failed to canonicalize CODEX_HOME {val:?}: {err}"),
+                        format!("failed to canonicalize CODEX_HOME {val}: {err}"),
                     )
                 })?;
                 AbsolutePathBuf::from_absolute_path(canonical)
@@ -68,6 +71,8 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::ErrorKind;
     use tempfile::TempDir;
@@ -80,7 +85,8 @@ mod tests {
             .to_str()
             .expect("missing codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(Some(missing_str)).expect_err("missing CODEX_HOME");
+        let err = find_codex_home_from_env(Some(OsStr::new(missing_str)))
+            .expect_err("missing CODEX_HOME");
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(
             err.to_string().contains("CODEX_HOME"),
@@ -97,7 +103,8 @@ mod tests {
             .to_str()
             .expect("file codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(Some(file_str)).expect_err("file CODEX_HOME");
+        let err =
+            find_codex_home_from_env(Some(OsStr::new(file_str))).expect_err("file CODEX_HOME");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("not a directory"),
@@ -113,7 +120,8 @@ mod tests {
             .to_str()
             .expect("temp codex home path should be valid utf-8");
 
-        let resolved = find_codex_home_from_env(Some(temp_str)).expect("valid CODEX_HOME");
+        let resolved =
+            find_codex_home_from_env(Some(OsStr::new(temp_str))).expect("valid CODEX_HOME");
         let expected = temp_home
             .path()
             .canonicalize()
@@ -130,5 +138,46 @@ mod tests {
         expected.push(".codex");
         let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
         assert_eq!(resolved, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_codex_home_env_non_utf8_directory_is_honored() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_home = TempDir::new().expect("temp home");
+        let non_utf8 = temp_home
+            .path()
+            .join(OsStr::from_bytes(b"codex-home-\xff\xfe"));
+        fs::create_dir(&non_utf8).expect("create non-utf8 codex home");
+
+        let resolved =
+            find_codex_home_from_env(Some(non_utf8.as_os_str())).expect("non-utf8 CODEX_HOME");
+        let expected = AbsolutePathBuf::from_absolute_path(
+            non_utf8.canonicalize().expect("canonicalize non-utf8 home"),
+        )
+        .expect("absolute home");
+        assert_eq!(resolved, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_codex_home_env_non_utf8_missing_path_is_fatal() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_home = TempDir::new().expect("temp home");
+        let missing = temp_home
+            .path()
+            .join(OsStr::from_bytes(b"missing-codex-home-\xff"));
+        let missing = OsString::from_vec(missing.into_os_string().into_vec());
+
+        let err =
+            find_codex_home_from_env(Some(&missing)).expect_err("missing non-utf8 CODEX_HOME");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
     }
 }
